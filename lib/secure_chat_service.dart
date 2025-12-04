@@ -1,93 +1,75 @@
-// lib/secure_chat_service.dart
 import 'dart:convert';
 import 'package:cryptography/cryptography.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
+// Имена ключей для симуляции двух пользователей
 const ALICE_PRIV_KEY = 'alice_priv';
 const BOB_PRIV_KEY = 'bob_priv';
 
 class SecureChatService {
   final _storage = const FlutterSecureStorage();
+  final _x25519 = X25519();
   final _ecdsa = Ed25519();
-  final _aesGcm = AesGcm.withGcm(
-      keyLength: 32,
-      macAlgorithm: Hmac.sha256()); // AES-256 для сообщений
+  final _aesGcm = AesGcm.with256bits();
 
   SimpleKeyPair? localKeyPair;
   PublicKey? remotePublicKey;
   SecretKey? sharedSecret;
 
-  // 1. АУТЕНТИФИКАЦИЯ И УПРАВЛЕНИЕ КЛЮЧАМИ (Secure Key Management)
-  // ---
-
-  // Симуляция регистрации: генерируем и сохраняем ключи
+  /// Генерация и сохранение ключа пользователя
   Future<SimpleKeyPair> initializeUser(String keyAlias) async {
-    final newKeyPair = await _ecdsa.newKeyPair();
-    final privateKeyBytes = (await newKeyPair.extractPrivateKey()).bytes;
+    // Генерация X25519 пары
+    final keyPair = await _x25519.newKeyPair();
+    final keyData = await keyPair.extract();
+    final privateKeyBytes = keyData.bytes;
 
-    // Сохранение приватного ключа в Secure Storage
     await _storage.write(
       key: keyAlias,
       value: base64.encode(privateKeyBytes),
     );
-    localKeyPair = newKeyPair;
-    return newKeyPair;
+
+    localKeyPair = keyPair;
+    return keyPair;
   }
 
-  // 2. ОБМЕН КЛЮЧАМИ (ECDH Key Exchange)
-  // ---
-
-  Future<void> setupChat(
-      String localKeyAlias, PublicKey recipientPublicKey) async {
-    // 1. Загрузка локального приватного ключа
+  /// Настройка чата с получением общего секрета
+  Future<void> setupChat(String localKeyAlias, PublicKey recipientPublicKey) async {
     final privateKeyBase64 = await _storage.read(key: localKeyAlias);
     if (privateKeyBase64 == null) {
       throw Exception('Private key not found for $localKeyAlias');
     }
-
     final privateKeyBytes = base64.decode(privateKeyBase64);
 
-    // Восстановление SimpleKeyPair (для ECDH и подписей)
-    // Важно: для ECDH используется X25519, но ключ Ed25519 конвертируем
-    final x25519 = X25519();
-    localKeyPair = SimpleKeyPair(
-      privateKey: SimplePrivateKey(privateKeyBytes, algorithm: x25519),
-      publicKey: recipientPublicKey,
-    );
+    // Восстановление пары из приватного ключа
+    final keyPair = await _x25519.newKeyPairFromSeed(privateKeyBytes);
+    localKeyPair = keyPair;
     remotePublicKey = recipientPublicKey;
 
-    // 2. ВЫЧИСЛЕНИЕ ОБЩЕГО СЕКРЕТА
-    sharedSecret = await x25519.sharedSecret(
-      localKeyPair: localKeyPair!,
+    // Вычисление общего секрета
+    sharedSecret = await _x25519.sharedSecretKey(
+      keyPair: localKeyPair!,
       remotePublicKey: remotePublicKey!,
     );
   }
 
-  // 3. ШИФРОВАНИЕ И ПОДПИСЬ СООБЩЕНИЯ (AES-256 & Digital Signatures)
-  // ---
-
+  /// Шифрование и подпись сообщения
   Future<EncryptedMessage> encryptAndSign(String plaintext) async {
-    final messageBytes = utf8.encode(plaintext);
+    if (sharedSecret == null || localKeyPair == null) {
+      throw Exception('Chat not initialized!');
+    }
 
-    // 1. Шифрование сообщения (AES-256 GCM)
+    final messageBytes = utf8.encode(plaintext);
     final nonce = _aesGcm.newNonce();
+
     final secretBox = await _aesGcm.encrypt(
       messageBytes,
       secretKey: sharedSecret!,
       nonce: nonce,
     );
 
-    // 2. Подпись сообщения (ЦИФРОВАЯ ПОДПИСЬ)
-    final signingKeyPair = SimpleKeyPair(
-        privateKey: (await localKeyPair!.extractPrivateKey()),
-        publicKey: (await localKeyPair!.extractPublicKey()),
-        algorithm: _ecdsa // Используем Ed25519 для подписи
-    );
-
-    // Подписываем именно зашифрованный текст для проверки целостности
     final signature = await _ecdsa.sign(
       secretBox.cipherText,
-      keyPair: signingKeyPair,
+      keyPair: localKeyPair!,
     );
 
     return EncryptedMessage(
@@ -98,28 +80,23 @@ class SecureChatService {
     );
   }
 
-  // 4. ПРОВЕРКА ЦЕЛОСТНОСТИ И ДЕШИФРОВАНИЕ
-  // ---
+  /// Дешифрование и проверка подписи
+  Future<String> decryptAndVerify(EncryptedMessage encryptedMessage, PublicKey senderPublicKey) async {
+    if (sharedSecret == null) throw Exception('Chat not initialized!');
 
-  Future<String> decryptAndVerify(EncryptedMessage encryptedMessage,
-      PublicKey senderPublicKey) async {
     final secretBox = SecretBox(
       encryptedMessage.ciphertext,
       nonce: encryptedMessage.nonce,
       mac: Mac(encryptedMessage.mac),
     );
 
-    // 1. ПРОВЕРКА ЦЕЛОСТНОСТИ и АУТЕНТИЧНОСТИ (Цифровая Подпись)
-    final isSignatureValid = await _ecdsa.verify(
-      encryptedMessage.ciphertext, // Проверяем подпись зашифрованного текста
+    final isValid = await _ecdsa.verify(
+      encryptedMessage.ciphertext,
       signature: Signature(encryptedMessage.signature, publicKey: senderPublicKey),
     );
 
-    if (!isSignatureValid) {
-      throw Exception('Signature verification failed! Message integrity compromised.');
-    }
+    if (!isValid) throw Exception('Signature verification failed!');
 
-    // 2. ДЕШИФРОВАНИЕ (AES-256 GCM)
     final decryptedBytes = await _aesGcm.decrypt(
       secretBox,
       secretKey: sharedSecret!,
