@@ -1,121 +1,242 @@
+// lib/main.dart (Интерактивный Чат - ИСПРАВЛЕННЫЙ)
 import 'package:flutter/material.dart';
+import 'secure_chat_service.dart';
+import 'package:cryptography/cryptography.dart';
+import 'package:bcrypt/bcrypt.dart'; // Используем BCrypt
+// import 'my_own_sha256.dart'; // Примитив "с нуля" для презентации
 
-void main() {
-  runApp(const MyApp());
-}
+void main() => runApp(const MyApp());
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
-      ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+    return const MaterialApp(
+      title: 'Secure Messaging App',
+      home: SecureChatScreen(),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
+enum User { Alice, Bob }
 
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+class SecureChatScreen extends StatefulWidget {
+  const SecureChatScreen({super.key});
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  State<SecureChatScreen> createState() => _SecureChatScreenState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _SecureChatScreenState extends State<SecureChatScreen> {
+  final _messageController = TextEditingController();
+  final _scrollController = ScrollController();
 
-  void _incrementCounter() {
+  // Сервисы для двух пользователей
+  final _aliceService = SecureChatService();
+  final _bobService = SecureChatService();
+
+  // Состояние чата
+  List<Map<String, String>> _messages = [];
+  User _currentSender = User.Alice; // Отправитель по умолчанию
+  bool _isInitialized = false;
+
+  // Публичные ключи для обмена
+  PublicKey? alicePubKey;
+  PublicKey? bobPubKey;
+
+  @override
+  void initState() {
+    super.initState();
+    _initializeKeysAndChat();
+  }
+
+  // --- 1. ИНИЦИАЛИЗАЦИЯ И НАСТРОЙКА КЛЮЧЕЙ (ВЫПОЛНЯЕТСЯ ОДИН РАЗ) ---
+  Future<void> _initializeKeysAndChat() async {
+    _addSystemMessage('Инициализация...');
+
+    // 1. Симуляция регистрации и хеширования пароля (bcrypt)
+    // ИСПРАВЛЕНИЕ ОШИБКИ ROUNDS: Используем BCrypt.gensalt() без аргументов
+    final salt = BCrypt.gensalt();
+    BCrypt.hashpw('secure_password_123', salt);
+
+    // 2. Генерация ключей и сохранение их в Secure Storage
+    final aliceKeyPair = await _aliceService.initializeUser(ALICE_PRIV_KEY);
+    final bobKeyPair = await _bobService.initializeUser(BOB_PRIV_KEY);
+    alicePubKey = await aliceKeyPair.extractPublicKey();
+    bobPubKey = await bobKeyPair.extractPublicKey();
+
+    // 3. Обмен публичными ключами и установка общего секрета (ECDH)
+    await _aliceService.setupChat(ALICE_PRIV_KEY, bobPubKey!);
+    await _bobService.setupChat(BOB_PRIV_KEY, alicePubKey!);
+
     setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+      _isInitialized = true;
+      _addSystemMessage('✅ Чат между Алисой и Бобом готов к работе!');
+    });
+  }
+
+  // --- 2. ЛОГИКА ОТПРАВКИ И ПОЛУЧЕНИЯ СООБЩЕНИЯ ---
+  void _sendMessage() async {
+    if (!_isInitialized || _messageController.text.isEmpty) return;
+
+    final plaintext = _messageController.text;
+    final senderService = _currentSender == User.Alice ? _aliceService : _bobService;
+    final recipientService = _currentSender == User.Alice ? _bobService : _aliceService;
+    final senderPubKey = _currentSender == User.Alice ? alicePubKey! : bobPubKey!;
+
+    _messageController.clear();
+
+    try {
+      // 1. ОТПРАВКА: Шифрование и Подпись
+      final encryptedMessage = await senderService.encryptAndSign(plaintext);
+      final ciphertextPreview = encryptedMessage.ciphertext.sublist(0, 10).map((e) => e.toRadixString(16).padLeft(2, '0')).join('');
+
+      _addMessage(_currentSender, plaintext, '🔒 Зашифровано и Подписано: $ciphertextPreview...');
+
+      // 2. ПОЛУЧЕНИЕ: Проверка и Дешифрование
+      final decryptedMessage = await recipientService.decryptAndVerify(encryptedMessage, senderPubKey);
+
+      _addSystemMessage('Проверено и Расшифровано Получателем (${recipientService == _aliceService ? 'Алиса' : 'Боб'}): "$decryptedMessage"');
+
+    } catch (e) {
+      _addSystemMessage('❌ Ошибка безопасности при отправке: $e');
+    }
+
+    // Прокрутка вниз
+    _scrollController.animateTo(
+      _scrollController.position.maxScrollExtent,
+      duration: const Duration(milliseconds: 300),
+      curve: Curves.easeOut,
+    );
+  }
+
+  // --- 3. UI И МЕТОДЫ ПОМОЩНИКИ ---
+  void _addMessage(User sender, String plaintext, String status) {
+    setState(() {
+      _messages.add({
+        'user': sender.name,
+        'text': plaintext,
+        'status': status,
+      });
+    });
+  }
+
+  void _addSystemMessage(String text) {
+    setState(() {
+      _messages.add({'user': 'System', 'text': text, 'status': ''});
     });
   }
 
   @override
+  void dispose() {
+    _messageController.dispose();
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
     return Scaffold(
       appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
+        title: const Text('Secure Messaging Demo (E2EE)'),
+        backgroundColor: Colors.blueGrey,
+        actions: [
+          // Переключатель отправителя
+          DropdownButton<User>(
+            value: _currentSender,
+            onChanged: (User? newValue) {
+              if (newValue != null) {
+                setState(() {
+                  _currentSender = newValue;
+                  _addSystemMessage('Отправитель переключен на: ${_currentSender.name}');
+                });
+              }
+            },
+            items: User.values.map<DropdownMenuItem<User>>((User value) {
+              return DropdownMenuItem<User>(
+                value: value,
+                child: Text('Отправить как ${value.name}'),
+              );
+            }).toList(),
+          ),
+          const SizedBox(width: 16),
+        ],
       ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: .center,
-          children: [
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+      body: Column(
+        children: <Widget>[
+          // Область сообщений
+          Expanded(
+            child: ListView.builder(
+              controller: _scrollController,
+              padding: const EdgeInsets.all(8.0),
+              itemCount: _messages.length,
+              itemBuilder: (context, index) {
+                final message = _messages[index];
+                if (message['user'] == 'System') {
+                  return ListTile(
+                    title: Text(message['text']!, style: const TextStyle(color: Colors.red, fontStyle: FontStyle.italic)),
+                  );
+                }
+
+                final isAlice = message['user'] == User.Alice.name;
+
+                return Align(
+                  alignment: isAlice ? Alignment.centerRight : Alignment.centerLeft,
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4.0),
+                    child: Column(
+                      crossAxisAlignment: isAlice ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+                      children: [
+                        Container(
+                          padding: const EdgeInsets.all(12),
+                          decoration: BoxDecoration(
+                            color: isAlice ? Colors.blue[100] : Colors.green[100],
+                            borderRadius: BorderRadius.circular(15),
+                          ),
+                          child: Text(
+                            message['text']!,
+                            style: const TextStyle(fontSize: 16),
+                          ),
+                        ),
+                        // Статус шифрования/подписи
+                        Text(
+                          '${message['user']}: ${message['status']}',
+                          style: TextStyle(fontSize: 10, color: Colors.grey[600]),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
             ),
-          ],
-        ),
-      ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
+          ),
+
+          // Поле ввода и кнопка отправки
+          Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: Row(
+              children: <Widget>[
+                Expanded(
+                  child: TextField(
+                    controller: _messageController,
+                    decoration: InputDecoration(
+                      hintText: "Сообщение для ${( _currentSender == User.Alice ? 'Боба' : 'Алисы')}...",
+                      border: const OutlineInputBorder(),
+                    ),
+                    onSubmitted: (_) => _sendMessage(),
+                  ),
+                ),
+                const SizedBox(width: 8.0),
+                FloatingActionButton(
+                  onPressed: _isInitialized ? _sendMessage : null,
+                  backgroundColor: _isInitialized ? Colors.blueGrey : Colors.grey,
+                  child: const Icon(Icons.send),
+                ),
+              ],
+            ),
+          ),
+        ],
       ),
     );
   }
