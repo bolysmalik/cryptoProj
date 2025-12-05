@@ -1,7 +1,11 @@
-import 'package:cryptoproject/secure_chat_service.dart';
+// lib/main.dart (Финальная рабочая версия)
+
 import 'package:flutter/material.dart';
 import 'package:cryptography/cryptography.dart';
 import 'package:bcrypt/bcrypt.dart';
+// Импортируем сервис и новые константы
+import 'secure_chat_service.dart';
+
 
 void main() => runApp(const MyApp());
 
@@ -30,15 +34,20 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
   final _messageController = TextEditingController();
   final _scrollController = ScrollController();
 
+  // Сервисы для двух пользователей
   final _aliceService = SecureChatService();
   final _bobService = SecureChatService();
 
+  // Состояние чата
   List<Map<String, String>> _messages = [];
   User _currentSender = User.Alice;
   bool _isInitialized = false;
 
-  PublicKey? alicePubKey;
-  PublicKey? bobPubKey;
+  // ⚠️ ДВЕ ГРУППЫ ПУБЛИЧНЫХ КЛЮЧЕЙ:
+  PublicKey? aliceECDHPublicKey; // X25519 для обмена ключами
+  PublicKey? bobECDHPublicKey;
+  PublicKey? aliceSigningPublicKey; // Ed25519 для проверки подписи
+  PublicKey? bobSigningPublicKey;
 
   @override
   void initState() {
@@ -46,23 +55,26 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     _initializeKeysAndChat();
   }
 
+  // --- 1. ИНИЦИАЛИЗАЦИЯ И НАСТРОЙКА КЛЮЧЕЙ ---
   Future<void> _initializeKeysAndChat() async {
     _addSystemMessage("Инициализация E2EE...");
 
-    // Пример хеширования пароля
+    // 1. Симуляция хеширования пароля (bcrypt)
     final salt = BCrypt.gensalt();
     BCrypt.hashpw('secure_password_123', salt);
 
-    // Генерация ключей
-    final aliceKeyPair = await _aliceService.initializeUser(ALICE_PRIV_KEY);
-    final bobKeyPair = await _bobService.initializeUser(BOB_PRIV_KEY);
+    // 2. Генерация ключей и сохранение (ECDH и Ed25519 для каждого)
+    // initializeUser возвращает ECDH Public Key, а ключ подписи сохраняется в сервисе
+    aliceECDHPublicKey = await _aliceService.initializeUser(ALICE_ECDH_KEY, ALICE_SIGN_KEY);
+    bobECDHPublicKey = await _bobService.initializeUser(BOB_ECDH_KEY, BOB_SIGN_KEY);
 
-    alicePubKey = await aliceKeyPair.extractPublicKey();
-    bobPubKey = await bobKeyPair.extractPublicKey();
+    // 3. Получение публичных ключей Ed25519 для проверки подписи
+    aliceSigningPublicKey = _aliceService.signingPublicKey;
+    bobSigningPublicKey = _bobService.signingPublicKey;
 
-    // Обмен ключами
-    await _aliceService.setupChat(ALICE_PRIV_KEY, bobPubKey!);
-    await _bobService.setupChat(BOB_PRIV_KEY, alicePubKey!);
+    // 4. Обмен ключами (ECDH)
+    await _aliceService.setupChat(ALICE_ECDH_KEY, ALICE_SIGN_KEY, bobECDHPublicKey!);
+    await _bobService.setupChat(BOB_ECDH_KEY, BOB_SIGN_KEY, aliceECDHPublicKey!);
 
     setState(() {
       _isInitialized = true;
@@ -71,6 +83,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     _addSystemMessage("✅ Чат между Алисой и Бобом готов (ECDH + AES + Ed25519)");
   }
 
+  // --- 2. ЛОГИКА ОТПРАВКИ И ПОЛУЧЕНИЯ СООБЩЕНИЯ ---
   void _sendMessage() async {
     if (!_isInitialized || _messageController.text.isEmpty) return;
 
@@ -79,10 +92,13 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
 
     final sender = _currentSender == User.Alice ? _aliceService : _bobService;
     final receiver = _currentSender == User.Alice ? _bobService : _aliceService;
-    final senderPubKey = _currentSender == User.Alice ? alicePubKey! : bobPubKey!;
+
+    // ⚠️ ВАЖНО: Используем ПУБЛИЧНЫЙ КЛЮЧ ПОДПИСИ ОТПРАВИТЕЛЯ (Ed25519)
+    final senderSigningKey = _currentSender == User.Alice ? aliceSigningPublicKey! : bobSigningPublicKey!;
     final receiverName = _currentSender == User.Alice ? "Боб" : "Алиса";
 
     try {
+      // 1. ОТПРАВКА: Шифрование и Подпись
       final encrypted = await sender.encryptAndSign(text);
 
       final hexPreview = encrypted.ciphertext
@@ -92,7 +108,8 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
 
       _addMessage(_currentSender, text, "🔐 Encrypted: $hexPreview...");
 
-      final decrypted = await receiver.decryptAndVerify(encrypted, senderPubKey);
+      // 2. ПОЛУЧЕНИЕ: Проверка Подписи и Дешифрование
+      final decrypted = await receiver.decryptAndVerify(encrypted, senderSigningKey);
 
       _addSystemMessage("📩 ($receiverName получил): $decrypted");
 
@@ -109,6 +126,7 @@ class _SecureChatScreenState extends State<SecureChatScreen> {
     });
   }
 
+  // --- 3. UI И МЕТОДЫ ПОМОЩНИКИ ---
   void _addMessage(User sender, String text, String status) {
     setState(() {
       _messages.add({'user': sender.name, 'text': text, 'status': status});
